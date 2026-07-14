@@ -1,23 +1,33 @@
+def parseEnvFile(String content) {
+    def result = [:]
+    content.readLines().each { line ->
+        def trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith('#')) {
+            return
+        }
+        def separatorIndex = trimmed.indexOf('=')
+        if (separatorIndex <= 0) {
+            return
+        }
+        def key = trimmed.substring(0, separatorIndex).trim()
+        def value = trimmed.substring(separatorIndex + 1).trim()
+        result[key] = value
+    }
+    return result
+}
+
 def serverConfig = [
     "test": [
         ip: "47.119.185.39",
         user: "alex",
         cred: "aliyun-server-ssh-key",
-        appHome: "/home/alex/alex-ui",
-        appPort: "80",
-        containerPort: "80",
-        appNetwork: "network",
-        containerName: "alex-ui-nginx"
+        appHome: "/home/alex/alex-ui"
     ],
     "prod": [
         ip: "47.119.185.39",
         user: "alex",
         cred: "aliyun-server-ssh-key",
-        appHome: "/home/alex/alex-ui",
-        appPort: "80",
-        containerPort: "80",
-        appNetwork: "network",
-        containerName: "alex-ui-nginx"
+        appHome: "/home/alex/alex-ui"
     ]
 ]
 
@@ -49,6 +59,7 @@ pipeline {
         stage('Init') {
             agent any
             steps {
+                checkout scm
                 script {
                     if (!params.IMAGE_TAG?.trim()) {
                         error 'IMAGE_TAG 不能为空'
@@ -57,19 +68,29 @@ pipeline {
                     if (cfg == null) {
                         error "未知环境: ${params.DEPLOY_ENV}"
                     }
+                    def deployEnvFile = "deploy/${params.DEPLOY_ENV}.env"
+                    if (!fileExists(deployEnvFile)) {
+                        error "环境配置文件不存在: ${deployEnvFile}"
+                    }
+                    def deployEnvConfig = parseEnvFile(readFile(file: deployEnvFile))
                     env.SOURCE_IMAGE_TAG = params.IMAGE_TAG.trim()
                     env.RELEASE_TAG = params.RELEASE_TAG?.trim() ?: ''
                     env.SOURCE_IMAGE_FULL = "${env.REGISTRY_HOST}/${env.REGISTRY_REPO}:${env.SOURCE_IMAGE_TAG}"
                     env.RELEASE_IMAGE_FULL = env.RELEASE_TAG ? "${env.REGISTRY_HOST}/${env.REGISTRY_REPO}:${env.RELEASE_TAG}" : ''
                     env.DEPLOY_IMAGE_FULL = env.RELEASE_TAG ? env.RELEASE_IMAGE_FULL : env.SOURCE_IMAGE_FULL
+                    env.DEPLOY_ENV_FILE = deployEnvFile
                     env.DEPLOY_IP = cfg.ip
                     env.DEPLOY_USER = cfg.user
                     env.DEPLOY_CRED = cfg.cred
                     env.DEPLOY_HOME = cfg.appHome
-                    env.DEPLOY_APP_PORT = cfg.appPort
-                    env.DEPLOY_CONTAINER_PORT = cfg.containerPort
-                    env.DEPLOY_NETWORK = cfg.appNetwork
-                    env.DEPLOY_CONTAINER_NAME = cfg.containerName
+                    env.DEPLOY_APP_PORT = deployEnvConfig['APP_PORT'] ?: ''
+                    env.DEPLOY_CONTAINER_PORT = deployEnvConfig['CONTAINER_PORT'] ?: ''
+                    env.DEPLOY_NETWORK = deployEnvConfig['APP_NETWORK'] ?: ''
+                    env.DEPLOY_CONTAINER_NAME = deployEnvConfig['CONTAINER_NAME'] ?: ''
+                    if (!env.DEPLOY_APP_PORT?.trim()) {
+                        error "环境配置缺少 APP_PORT: ${deployEnvFile}"
+                    }
+                    env.DEPLOY_HEALTH_URL = "http://${cfg.ip}:${env.DEPLOY_APP_PORT}/alex/"
                 }
             }
         }
@@ -91,6 +112,7 @@ pipeline {
                     服务端口: ${env.DEPLOY_APP_PORT}
                     容器端口: ${env.DEPLOY_CONTAINER_PORT}
                     容器网络: ${env.DEPLOY_NETWORK}
+                    环境文件: ${env.DEPLOY_ENV_FILE}
                     发布模式: ${env.RELEASE_TAG ? '先打 Release Tag，再部署' : '普通部署'}
                     制品来源: main 分支 CI
                     ==================================
@@ -128,22 +150,18 @@ pipeline {
         stage('Deploy') {
             agent any
             steps {
-                checkout scm
+                checkout scm   // 拉取 docker-compose.yml 和环境配置文件
                 script {
                     withCredentials([usernamePassword(credentialsId: env.REGISTRY_CREDENTIALS_ID, usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
                         sshagent([env.DEPLOY_CRED]) {
                             sh """
                                 set -e
                                 test -f "${WORKSPACE}/docker-compose.yml"
+                                test -f "${WORKSPACE}/${env.DEPLOY_ENV_FILE}"
                                 ssh ${env.DEPLOY_USER}@${env.DEPLOY_IP} "mkdir -p ${env.DEPLOY_HOME}"
                                 scp "${WORKSPACE}/docker-compose.yml" ${env.DEPLOY_USER}@${env.DEPLOY_IP}:${env.DEPLOY_HOME}/docker-compose.yml
-                                ssh ${env.DEPLOY_USER}@${env.DEPLOY_IP} "printf '%s\n' \
-                                'APP_IMAGE=${env.DEPLOY_IMAGE_FULL}' \
-                                'CONTAINER_NAME=${env.DEPLOY_CONTAINER_NAME}' \
-                                'APP_PORT=${env.DEPLOY_APP_PORT}' \
-                                'CONTAINER_PORT=${env.DEPLOY_CONTAINER_PORT}' \
-                                'APP_NETWORK=${env.DEPLOY_NETWORK}' \
-                                > ${env.DEPLOY_HOME}/.env"
+                                scp "${WORKSPACE}/${env.DEPLOY_ENV_FILE}" ${env.DEPLOY_USER}@${env.DEPLOY_IP}:${env.DEPLOY_HOME}/.env
+                                ssh ${env.DEPLOY_USER}@${env.DEPLOY_IP} "sed -i 's|^APP_IMAGE=.*|APP_IMAGE=${env.DEPLOY_IMAGE_FULL}|' ${env.DEPLOY_HOME}/.env"
                                 printf '%s' "\$REG_PASS" | ssh ${env.DEPLOY_USER}@${env.DEPLOY_IP} "docker login ${env.REGISTRY_HOST} -u \"\$REG_USER\" --password-stdin"
                                 ssh ${env.DEPLOY_USER}@${env.DEPLOY_IP} "
                                     set -e
@@ -155,6 +173,30 @@ pipeline {
                                 "
                             """
                         }
+                    }
+                }
+            }
+        }
+
+        stage('Health Check') {
+            agent any
+            steps {
+                script {
+                    sshagent([env.DEPLOY_CRED]) {
+                        sh """
+                            ssh ${env.DEPLOY_USER}@${env.DEPLOY_IP} "
+                                set -e
+                                sleep 10
+                                if curl -fsS '${env.DEPLOY_HEALTH_URL}' >/dev/null; then
+                                    echo '健康检查通过: ${env.DEPLOY_HEALTH_URL}'
+                                else
+                                    echo '健康检查失败: ${env.DEPLOY_HEALTH_URL}'
+                                    cd ${env.DEPLOY_HOME}
+                                    docker compose logs --tail=100
+                                    exit 1
+                                fi
+                            "
+                        """
                     }
                 }
             }
