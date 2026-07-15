@@ -17,8 +17,7 @@ LABEL org.opencontainers.image.title="${APP_NAME}" \
 
 USER root
 
-RUN apk add --no-cache wget \
-    && mkdir -p /usr/share/nginx/html /etc/nginx/conf.d /tmp/nginx \
+RUN mkdir -p /usr/share/nginx/html /etc/nginx/conf.d /tmp/nginx \
     && chown -R nginx:nginx /usr/share/nginx/html /etc/nginx/conf.d /tmp/nginx
 
 # 挂载站点配置文件，覆盖 nginx 默认站点配置
@@ -27,8 +26,5 @@ COPY --chown=nginx:nginx default.conf /etc/nginx/conf.d/default.conf
 COPY --chown=nginx:nginx dist/ /usr/share/nginx/html/
 
 EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -q -O /dev/null http://127.0.0.1:8080/alex/ || exit 1
 
 USER nginx
