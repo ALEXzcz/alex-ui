@@ -42,10 +42,15 @@ pipeline {
                 script {
                     env.BUILD_TS = sh(script: "date +%Y%m%d%H%M%S", returnStdout: true).trim()
                     env.GIT_SHORT_SHA = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.GIT_COMMIT_FULL = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+                    env.GIT_AUTHOR = sh(script: "git log -1 --pretty=format:'%an <%ae>'", returnStdout: true).trim()
+                    env.GIT_REMOTE_URL = sh(script: "git config --get remote.origin.url", returnStdout: true).trim()
                     env.TRACE_TAG = "${env.BUILD_TS}-${env.GIT_SHORT_SHA}"
                     env.SAFE_BRANCH_NAME = env.BRANCH_NAME.replaceAll(/[^A-Za-z0-9_.-]/, '-')
                     env.LOCAL_IMAGE = env.IS_MAIN_BRANCH == 'true' ? "alex-ui-ci:${env.SAFE_BRANCH_NAME}-${env.BUILD_NUMBER}-${env.GIT_SHORT_SHA}" : ''
                     env.IMAGE_FULL = env.IS_MAIN_BRANCH == 'true' ? "${env.REGISTRY_HOST}/${env.REGISTRY_REPO}:${env.TRACE_TAG}" : ''
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.BRANCH_NAME} ${env.GIT_SHORT_SHA}"
+                    currentBuild.description = "branch=${env.BRANCH_NAME}, commit=${env.GIT_COMMIT_FULL}, image=${env.IMAGE_FULL ?: 'N/A'}"
                     echo """
                     ========== GitHub Flow CI 构建信息 ==========
                     分支: ${env.BRANCH_NAME}
@@ -63,12 +68,34 @@ pipeline {
             }
         }
 
+        stage('Record Build Metadata') {
+            steps {
+                writeFile file: 'ci-build-info.properties', text: """
+                    BRANCH_NAME=${env.BRANCH_NAME}
+                    BRANCH_KIND=${env.BRANCH_KIND}
+                    BUILD_NUMBER=${env.BUILD_NUMBER}
+                    BUILD_TS=${env.BUILD_TS}
+                    GIT_COMMIT=${env.GIT_COMMIT_FULL}
+                    GIT_SHORT_SHA=${env.GIT_SHORT_SHA}
+                    GIT_AUTHOR=${env.GIT_AUTHOR}
+                    GIT_REMOTE_URL=${env.GIT_REMOTE_URL}
+                    TRACE_TAG=${env.TRACE_TAG}
+                    IMAGE_FULL=${env.IMAGE_FULL ?: ''}
+                    JOB_NAME=${env.JOB_NAME}
+                    BUILD_URL=${env.BUILD_URL}
+                """.trim() + "\n"
+            }
+        }
+
         stage('Verify') {
             steps {
                 sh 'npm ci'
                 sh 'npm run build'
             }
             post {
+                always {
+                    archiveArtifacts artifacts: 'ci-build-info.properties', onlyIfSuccessful: false, allowEmptyArchive: true
+                }
                 success {
                     archiveArtifacts artifacts: 'dist/**', fingerprint: true
                 }
@@ -83,7 +110,14 @@ pipeline {
                 sh '''
                     set -e
                     test -d dist
-                    docker build -t "$LOCAL_IMAGE" .
+                    docker build \
+                      --build-arg APP_NAME="alex-ui" \
+                      --build-arg BUILD_TIME="$BUILD_TS" \
+                      --build-arg IMAGE_VERSION="$TRACE_TAG" \
+                      --build-arg VCS_REF="$GIT_COMMIT_FULL" \
+                      --build-arg VCS_URL="$GIT_REMOTE_URL" \
+                      --build-arg VCS_BRANCH="$BRANCH_NAME" \
+                      -t "$LOCAL_IMAGE" .
                     docker tag "$LOCAL_IMAGE" "$IMAGE_FULL"
                 '''
             }
