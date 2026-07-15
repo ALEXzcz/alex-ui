@@ -134,6 +134,8 @@ pipeline {
                     镜像拉取认证: 由部署机本地 docker login 提供
                     ==================================
                     """
+
+                    archiveArtifacts artifacts: 'deploy-record.properties', onlyIfSuccessful: false, allowEmptyArchive: true
                 }
             }
         }
@@ -255,9 +257,6 @@ pipeline {
     }
 
     post {
-        always {
-            archiveArtifacts artifacts: 'deploy-record.properties', onlyIfSuccessful: false, allowEmptyArchive: true
-        }
         success {
             echo "CD 成功: ${params.DEPLOY_ENV} -> ${env.DEPLOY_IP}, 镜像: ${env.DEPLOY_IMAGE_FULL}"
         }
